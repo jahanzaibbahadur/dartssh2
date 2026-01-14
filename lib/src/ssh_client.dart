@@ -9,6 +9,7 @@ import 'package:dartssh2/src/ssh_channel.dart';
 import 'package:dartssh2/src/ssh_channel_id.dart';
 import 'package:dartssh2/src/ssh_errors.dart';
 import 'package:dartssh2/src/ssh_forward.dart';
+import 'package:dartssh2/src/ssh_hostkey.dart';
 import 'package:dartssh2/src/ssh_keepalive.dart';
 import 'package:dartssh2/src/ssh_key_pair.dart';
 import 'package:dartssh2/src/ssh_session.dart';
@@ -38,6 +39,14 @@ typedef SSHUserInfoRequestHandler = FutureOr<List<String>?> Function(
 typedef SSHUserauthBannerHandler = void Function(String banner);
 
 typedef SSHAuthenticatedHandler = void Function();
+
+/// Callback for async signing operations. Used for hardware-backed keys
+/// (e.g., Android biometric keys) where signing requires async operations.
+/// If provided, this callback will be used instead of SSHKeyPair.sign().
+typedef SSHSignRequestHandler = FutureOr<Uint8List> Function(
+  SSHHostKey publicKey,
+  Uint8List data,
+);
 
 typedef SSHRemoteConnectionFilter = bool Function(String host, int port);
 
@@ -116,6 +125,12 @@ class SSHClient {
   /// is successful. Set this field to receive the banner message.
   final SSHUserauthBannerHandler? onUserauthBanner;
 
+  /// Optional callback for async signing operations. Used for hardware-backed
+  /// keys (e.g., Android biometric keys) where signing requires async operations
+  /// like biometric authentication. If provided, this callback will be used
+  /// instead of SSHKeyPair.sign() during public key authentication.
+  final SSHSignRequestHandler? onSignRequest;
+
   /// A [Future] that completes normally when the client is connected to the
   // Future<void> get handshake => _handshakeCompleter.future;
 
@@ -154,6 +169,7 @@ class SSHClient {
     this.onUserInfoRequest,
     this.onUserauthBanner,
     this.onAuthenticated,
+    this.onSignRequest,
     this.keepAliveInterval = const Duration(seconds: 10),
     this.disableHostkeyVerification = false,
   }) {
@@ -843,7 +859,7 @@ class SSHClient {
 
     if (_currentAuthMethod == SSHAuthMethod.publicKey) {
       if (_keyPairsLeft.isNotEmpty) {
-        return _authWithNextPublicKey();
+        return _catch(() => _authWithNextPublicKey());
       }
     }
 
@@ -863,7 +879,7 @@ class SSHClient {
       case SSHAuthMethod.password:
         return _catch(() => _authWithPassword());
       case SSHAuthMethod.publicKey:
-        return _authWithNextPublicKey();
+        return _catch(() => _authWithNextPublicKey());
       case SSHAuthMethod.keyboardInteractive:
         return _authWithKeyboardInteractive();
     }
@@ -888,7 +904,7 @@ class SSHClient {
     );
   }
 
-  void _authWithNextPublicKey() {
+  Future<void> _authWithNextPublicKey() async {
     printDebug?.call('SSHClient._authWithPublicKey');
 
     final keyPair = _keyPairsLeft.removeFirst();
@@ -900,12 +916,22 @@ class SSHClient {
       publicKey: keyPair.toPublicKey().encode(),
     );
 
+    // Use async signing callback if provided (for hardware-backed keys)
+    final Uint8List signatureBytes;
+    if (onSignRequest != null) {
+      printDebug?.call('Using async signing callback for ${keyPair.type}');
+      signatureBytes = await onSignRequest!(keyPair.toPublicKey(), challenge);
+    } else {
+      // Use synchronous signing for regular keys
+      signatureBytes = keyPair.sign(challenge).encode();
+    }
+
     _sendMessage(
       SSH_Message_Userauth_Request.publicKey(
         username: username,
         publicKeyAlgorithm: keyPair.type,
         publicKey: keyPair.toPublicKey().encode(),
-        signature: keyPair.sign(challenge).encode(),
+        signature: signatureBytes,
         // signature: null,
       ),
     );
